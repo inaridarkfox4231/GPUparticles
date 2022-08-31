@@ -1,4 +1,6 @@
 // 見る人増えてきたのでsimplifyします
+// hideを解除したときリセットされるように仕様変更（20220718）
+// hideしてるときにsaveできない問題を解消（20220727）
 
 // 色だけdat.GUIで変えられるようにしました。
 // 参考：h_doxasさんのhttps://wgld.org/d/webgl/w083.html です！
@@ -49,6 +51,26 @@
 // エンターキーだと数値入力の際に不具合が出るので
 // Rキーでリセットすることにした（82）
 
+// 20220831
+// bloom実装の前段階としてRenderNodeを最新版に更新（setFBOでエラーを出すなどいくつか改善されてる）
+// copyVertでマウスのy反転をしていなかったのでinput部分と両方直すことで改善（困るので）
+// さらにFragの方をmirrorFragに名前変更（copyFragを別に作って利用するので）
+// bloom関連のシェーダを移植
+// bgのFBOが不要だったので削除
+// configにBLOOM関連の変数を追加
+// TODO:initFramebuffersを導入して処理を導入してdyeの代わりにparticleを用いる
+// それでうまくいくはずです
+// 最終的にはparticleに結果を代入してって思ったけど
+// mirrorがあるからワンクッションおかないとまずいわね。
+// ワンクッションおいてdyeに...というかまあ、いいや。dyeに落として、framebufferに。
+// それにbloomかけて最終的にbloomを足して結果とする。
+
+// 移した。dyeを表示するところまでやりました。あとはbloomをapplyするだけ。
+
+// 20220901
+// shaderを一通り用意。
+// bloom実装完了. お疲れさまでした。
+
 // --------------------------------------------------------------- //
 // global.
 
@@ -79,6 +101,8 @@ const Y_GRADATION = 2;
 const AUTO_SIZE = 0;
 const MANUAL_SIZE = 1;
 
+const testFunc = {'alert':function(){console.log("hello!")}};
+
 let config = {
   PARTICLE_COLOR:{r:32,g:64,b:255}, // パーティクルの色
   AUTO_COLOR:false, // trueの場合色が時間経過で変化する感じ
@@ -94,6 +118,14 @@ let config = {
   HEIGHT:768,
   HIDE:false, // パーティクルを描画しない
   TRANSPARENT:false, // 透過素材作成用
+  BLOOM: true,
+	BLOOM_DITHER: true,
+  BLOOM_ITERATIONS: 8,
+  BLOOM_RESOLUTION: 256,
+  BLOOM_INTENSITY: 0.8,
+  BLOOM_THRESHOLD: 0.6,
+  BLOOM_SOFT_KNEE: 0.7,
+  BLOOM_COLOR: "#fff",
 };
 
 let textureTableSource;
@@ -109,25 +141,45 @@ let saveFlag = false; // これをtrueにして...
 
 (function(){
   var gui = new dat.GUI({ width: 280 });
+
+	gui.add(testFunc, 'alert');
+
   gui.addColor(config, 'PARTICLE_COLOR').name('particleColor');
   gui.add(config, 'AUTO_COLOR').name('autoColor');
   gui.add(config, 'MIRROR_X').name('mirrorX');
   gui.add(config, 'MIRROR_Y').name('mirrorY');
+
   let bgFolder = gui.addFolder('bg');
   bgFolder.addColor(config, 'MAIN_COLOR').name('mainColor');
   bgFolder.addColor(config, 'SUB_COLOR').name('subColor');
   bgFolder.addColor(config, 'BASE_COLOR').name('baseColor');
   bgFolder.add(config, 'BGPATTERN', {'MONOTONE':MONOTONE_PATTERN, 'NOISE':NOISE_PATTERN, 'CHECK':CHECK_PATTERN, 'CLOUD':CLOUD_PATTERN, 'TRIANGLE':TRIANGLE_PATTERN, 'SEIGAIHA':SEIGAIHA_PATTERN, 'KOJI':KOJI_PATTERN, 'ASANOHA':ASANOHA_PATTERN}).name('pattern');
   bgFolder.add(config, 'GRADATION', {'MONOTONE':MONOTONE_GRADATION, 'GRADATION_X':X_GRADATION, 'GRADATION_Y':Y_GRADATION}).name('gradation');
-  let sizeFolder = gui.addFolder('size');
   bgFolder.add(config, 'TRANSPARENT').name('transparent');
+
+  let sizeFolder = gui.addFolder('size');
   sizeFolder.add(config, 'SIZETYPE', {'AUTO':AUTO_SIZE, 'MANUAL':MANUAL_SIZE}).name('sizeType');
   sizeFolder.add(config, 'WIDTH', 256, 1280, 1).name('width');
   sizeFolder.add(config, 'HEIGHT', 256, 768, 1).name('height');
+
+	let bloomFolder = gui.addFolder('bloom');
+  bloomFolder.add(config, 'BLOOM').name('bloom');
+	bloomFolder.add(config, 'BLOOM_DITHER').name('dither');
+  bloomFolder.add(config, 'BLOOM_ITERATIONS', 1, 8, 1).name('iterations');
+  bloomFolder.add(config, 'BLOOM_INTENSITY', 0, 5, 0.1).name('intensity');
+  bloomFolder.add(config, 'BLOOM_THRESHOLD', 0, 1, 0.1).name('threshold');
+  bloomFolder.add(config, 'BLOOM_SOFT_KNEE', 0, 1, 0.1).name('soft_knee');
+  bloomFolder.addColor(config, 'BLOOM_COLOR').name('bloom_color');
+
   gui.add({fun:saveFlagOn}, 'fun').name('save');
   gui.add({fun:dataInput}, 'fun').name('reset');
-  gui.add(config, 'HIDE').name('hide');
-})()
+  gui.add(config, 'HIDE').name('hide').onChange(showReset);
+})();
+
+// show時にリセット
+function showReset(){
+	if(!config.HIDE){ dataInput(); }
+}
 
 // ------------------------------------- //
 // texture用
@@ -254,7 +306,18 @@ const copyVert =
 "varying vec2 vUv;" +
 "void main () {" +
 "  vUv = aPosition * 0.5 + 0.5;" +
+"  vUv.y = 1.0 - vUv.y;" +
 "  gl_Position = vec4(aPosition, 0.0, 1.0);" +
+"}";
+
+// simpleなcopy用シェーダ
+const copyFrag =
+"precision mediump float;" +
+"precision mediump sampler2D;" +
+"varying highp vec2 vUv;" +
+"uniform sampler2D uTex;" +
+"void main () {" +
+"  gl_FragColor = texture2D(uTex, vUv);" +
 "}";
 
 // こっちで複製した方がめっちゃ楽やん
@@ -263,7 +326,7 @@ const copyVert =
 // (0.5,0.5)を中心として回転させるとかしても面白そうなんだけど、
 // 切れちゃうのがね...まずいんよね。だからせいぜいミラーリングまで
 // 例えば縮小して回転とかだったら可能だけれど(0.7程度に収めるとか)
-const copyFrag =
+const mirrorFrag =
 "precision mediump float;" +
 "precision mediump sampler2D;" +
 "varying highp vec2 vUv;" +
@@ -334,11 +397,148 @@ forTexture +
 "  gl_FragColor = vec4(col, 1.0);" +
 "}";
 
+// ---------------------------------------------------------------- //
+// bloom関連のシェーダ
+
+// 基本バーテックスシェーダ
+const baseVertexShader =
+"precision highp float;" +
+"attribute vec2 aPosition;" +
+"varying vec2 vUv;" +
+"varying vec2 vL;" + // left  // 「//」は中に入れちゃ駄目です。
+"varying vec2 vR;" + // right
+"varying vec2 vT;" + // top
+"varying vec2 vB;" + // bottom
+"uniform vec2 uTexelSize;" +
+"void main () {" +
+// 0～1の0～1で上下逆なのでTがプラス
+"  vUv = aPosition * 0.5 + 0.5;" +
+"  vL = vUv - vec2(uTexelSize.x, 0.0);" +
+"  vR = vUv + vec2(uTexelSize.x, 0.0);" +
+"  vT = vUv + vec2(0.0, uTexelSize.y);" +
+"  vB = vUv - vec2(0.0, uTexelSize.y);" +
+"  gl_Position = vec4(aPosition, 0.0, 1.0);" +
+"}";
+
+// simple vertex shader.
+// vLやら何やらを使ってない場合はこっちを使いましょう。copyとか使ってないはず。
+const simpleVertexShader =
+"precision highp float;" +
+"attribute vec2 aPosition;" +
+"varying vec2 vUv;" +
+"void main () {" +
+"  vUv = aPosition * 0.5 + 0.5;" +
+"  gl_Position = vec4(aPosition, 0.0, 1.0);" +
+"}";
+
+// ディスプレイ用
+const displayShaderSource =
+"precision highp float;" +
+"precision highp sampler2D;" +
+"varying vec2 vUv;" +
+"varying vec2 vL;" +
+"varying vec2 vR;" +
+"varying vec2 vT;" +
+"varying vec2 vB;" +
+"uniform sampler2D uTexture;" +
+"uniform sampler2D uDithering;" +
+"uniform vec2 uDitherScale;" +
+"uniform sampler2D uBloom;" +
+// 各種フラグ
+"uniform bool uBloomFlag;" +
+"uniform bool uDitheringFlag;" +
+// リニア→ガンマ
+"vec3 linearToGamma (vec3 color) {" + // linearをGammaに変換・・
+"  color = max(color, vec3(0));" +
+"  return max(1.055 * pow(color, vec3(0.416666667)) - 0.055, vec3(0));" +
+"}" +
+// メインコード
+"void main () {" +
+"  vec4 tex = texture2D(uTexture, vUv);" +
+"  vec3 c = tex.rgb;" +
+"  vec3 bloom;" +
+"  if(uBloomFlag){" +
+"    bloom = texture2D(uBloom, vUv).rgb;" +
+"    if(uDitheringFlag){" +
+"      float noise = texture2D(uDithering, vUv * uDitherScale).r;" +
+"      noise = noise * 2.0 - 1.0;" +
+"      bloom += noise / 255.0;" +
+"    }" +
+"    bloom = linearToGamma(bloom);" +
+"    c += bloom;" +
+"  }" +
+"  gl_FragColor = vec4(c, tex.a);" +
+"}";
+
+// どうも輝度抽出とかいうのをここでやってるっぽい
+// brがbrightness？というかまあc.r,c.g,c.bの最大値。
+// これがcurve.xより小さいと0になるのでそれで切ってる？
+// わからん.....
+const bloomPrefilterShader =
+"precision mediump float;" +
+"precision mediump sampler2D;" +
+"varying vec2 vUv;" +
+"uniform sampler2D uTexture;" +
+"uniform vec3 uCurve;" +
+"uniform float uThreshold;" +
+"void main () {" +
+"  vec3 c = texture2D(uTexture, vUv).rgb;" +
+"  float br = max(c.r, max(c.g, c.b));" +
+"  float rq = clamp(br - uCurve.x, 0.0, uCurve.y);" +
+"  rq = uCurve.z * rq * rq;" +
+"  c *= max(rq, br - uThreshold) / max(br, 0.0001);" +
+"  gl_FragColor = vec4(c, 0.0);" +
+"}";
+
+// bloomのメインシェーダ
+const bloomBlurShader =
+"precision mediump float;" +
+"precision mediump sampler2D;" +
+"varying vec2 vL;" +
+"varying vec2 vR;" +
+"varying vec2 vT;" +
+"varying vec2 vB;" +
+"uniform sampler2D uTexture;" +
+"void main () {" +
+"  vec4 sum = vec4(0.0);" +
+"  sum += texture2D(uTexture, vL);" +
+"  sum += texture2D(uTexture, vR);" +
+"  sum += texture2D(uTexture, vT);" +
+"  sum += texture2D(uTexture, vB);" +
+"  sum *= 0.25;" +
+"  gl_FragColor = sum;" +
+"}";
+
+// bloomの仕上げシェーダ
+// 最終的にブラーがかかったものができる！ようです！！
+const bloomFinalShader =
+"precision mediump float;" +
+"precision mediump sampler2D;" +
+"varying vec2 vL;" +
+"varying vec2 vR;" +
+"varying vec2 vT;" +
+"varying vec2 vB;" +
+"uniform sampler2D uTexture;" +
+"uniform float uIntensity;" +
+"uniform vec3 uBloomColor;" +
+"void main () {" +
+"  vec4 sum = vec4(0.0);" +
+"  sum += texture2D(uTexture, vL);" +
+"  sum += texture2D(uTexture, vR);" +
+"  sum += texture2D(uTexture, vT);" +
+"  sum += texture2D(uTexture, vB);" +
+"  sum *= 0.25;" +
+"  gl_FragColor = sum * uIntensity * vec4(uBloomColor, 1.0);" +
+"}";
+
 // ------------------------------ //
 // preload.
 
+let ditheringImg, ditheringTexture;
+
 function preload(){
   textureTableSource = loadImage("https://inaridarkfox4231.github.io/assets/texture/textureTable.png");
+	ditheringImg = loadImage("https://inaridarkfox4231.github.io/assets/texture/dither.png");
 }
 
 // --------------------------------------------------------------- //
@@ -352,22 +552,32 @@ function setup(){
   pixelDensity(1);
   gl = _gl.GL;
 
-  // extensionのチェック一通り
-  confirmExtensions();
-
   // nodeを用意
   _node = new RenderNode();
+  // extensionのチェック一通り
+  confirmExtensions();
+	// bloom用のframebufferを一通り用意する
+	initFramebuffers();
+
+  const positions = [-1, -1, -1, 1, 1, -1, 1, 1]; // 板ポリ用
+	// シェーダー用の汎用エイリアス
   let sh;
 
+  // ----- 背景 ----- //
+  sh = createShader(patternVert, patternFrag);
+  _node.regist('pattern', sh, 'board')
+       .registAttribute('aPosition', positions, 2);
+
+	// ----- GPUパーティクル関連 ----- //
   // dataShader:点の位置と速度の初期設定用
   sh = createShader(dataVert, dataFrag);
   _node.regist('input', sh, 'board')
-       .registAttribute('aPosition', [-1,1,-1,-1,1,1,1,-1], 2);
+       .registAttribute('aPosition', positions, 2);
 
   // moveShader:点の位置と速度の更新用
   sh = createShader(moveVert, moveFrag);
   _node.regist('move', sh, 'board')
-       .registAttribute('aPosition', [-1,1,-1,-1,1,1,1,-1], 2)
+       .registAttribute('aPosition', positions, 2)
        .registUniformLocation('uTex');
 
   // 点描画用のインデックスを格納する配列
@@ -381,30 +591,95 @@ function setup(){
        .registAttribute('aIndex', indices, 1)
        .registUniformLocation('uTex');
 
-  // copyShader: パーティクルレイヤー用
-  // ベースに上書きするだけの単純なシェーダ。
-  sh = createShader(copyVert, copyFrag);
-  _node.regist('copy', sh, 'board')
-       .registAttribute('aPosition', [-1,1,-1,-1,1,1,1,-1], 2)
+  // mirrorShader: パーティクルレイヤー用
+	// これの結果をdyeに格納する。
+  // ミラー機能追加
+  sh = createShader(copyVert, mirrorFrag);
+  _node.regist('mirror', sh, 'board')
+       .registAttribute('aPosition', positions, 2)
        .registUniformLocation('uTex');
 
-  // 背景用
-  sh = createShader(patternVert, patternFrag);
-  _node.regist('pattern', sh, 'board')
-       .registAttribute('aPosition', [-1,1,-1,-1,1,1,1,-1], 2);
+	// ----- bloom関連 ----- //
+	// 下準備。dyeから輝度を抽出
+  sh = createShader(simpleVertexShader, bloomPrefilterShader);
+  _node.regist('bloomPrefilter', sh, 'simple')
+       .registAttribute('aPosition', positions, 2)
+       .registUniformLocation('uTexture');
 
-  // doubleのFBOを用意。0と1を予約します。
-  _node.registDoubleFBO('data', 0, TEX_SIZE, TEX_SIZE, gl.FLOAT, gl.NEAREST);
-  // 焼き付け用
-  _node.registFBO('particle', 2, width, height, gl.FLOAT, gl.NEAREST);
-  // 背景用
-  _node.registFBO('bg', 3, width, height);
+	// blurをかける処理。ここだけ切り出すと通常のblurとして使えそう。
+  sh = createShader(baseVertexShader, bloomBlurShader);
+  _node.regist('bloomBlur', sh, 'board')
+       .registAttribute('aPosition', positions, 2)
+       .registUniformLocation('uTexture');
+
+	// 仕上げ。この結果を元の画像に加算合成する。
+  sh = createShader(baseVertexShader, bloomFinalShader);
+  _node.regist('bloomFinal', sh, 'board')
+       .registAttribute('aPosition', positions, 2)
+       .registUniformLocation('uTexture');
+
+	// display.今回直にbind:nullで描画するのはこれの結果。
+  sh = createShader(baseVertexShader, displayShaderSource);
+  _node.regist('display', sh, 'board')
+       .registAttribute('aPosition', positions, 2)
+       .registUniformLocation('uTexture')
+       .registUniformLocation('uBloom')
+	     .registUniformLocation('uDithering');
+
+  // doubleのFBOを用意。11と12を予約します。
+  _node.registDoubleFBO('data', 11, TEX_SIZE, TEX_SIZE, gl.FLOAT, gl.NEAREST);
+  // particle用に13を使う。これにmirrorを施してdyeに落としてそれからbloomをかける
+  _node.registFBO('particle', 13, width, height, gl.FLOAT, gl.NEAREST);
 
   // 位置と速度の初期設定
   dataInput();
 
   // textureTableのtextureを用意
   textureTable = new p5.Texture(_gl, textureTableSource);
+
+	// dithering用。
+	ditheringTexture = new p5.Texture(_gl, ditheringImg); // これ。64x64のモザイク。規則性は...無いように見える。
+
+	// ditheringTextureの用意。本家に倣ってパラメトリをいじる。
+	gl.bindTexture(gl.TEXTURE_2D, ditheringTexture.glTex);
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+
+// --------------------------------------- //
+// initFramebuffers.
+
+function initFramebuffers(){
+  const halfFloat = ext.textureHalfFloat.HALF_FLOAT_OES;
+  const linearFilterParam = (ext.textureHalfFloatLinear ? gl.LINEAR : gl.NEAREST);
+
+  gl.disable(gl.BLEND);
+
+  // dyeは0,1を使います。ここにparticleのmirrorしたやつを落とす...
+	// というかresizeの際にこれもいじる必要があるのか...めんど...
+  _node.registDoubleFBO("dye", 0, width, height, halfFloat, linearFilterParam);
+
+  // bloomは2～10を使います。
+  initBloomFramebuffers(); // 2～10.
+  // 11にbgTexを使う予定...分けないといけない
+  // fboで使う番号とtextureで使う番号を分けているのです
+}
+
+function initBloomFramebuffers(){
+  let res = getResolution(config.BLOOM_RESOLUTION);
+  const halfFloat = ext.textureHalfFloat.HALF_FLOAT_OES;
+  const linearFilterParam = (ext.textureHalfFloatLinear ? gl.LINEAR : gl.NEAREST);
+  // bloom_0と、bloom_1～bloom_8を用意する感じ
+  _node.registFBO('bloom_0', 2, res.frameWidth, res.frameHeight, halfFloat, linearFilterParam);
+  // ITERATIONSは最大で8で...まあ8で。
+  // bloom_0を用意した。bloom_1～bloom_8が用意される（予定）
+  for(let i = 1; i <= config.BLOOM_ITERATIONS; i++){
+    let fw = (res.frameWidth >> i);
+    let fh = (res.frameHeight >> i);
+    _node.registFBO('bloom_' + i, 2 + i, fw, fh, halfFloat, linearFilterParam);
+  }
 }
 
 // --------------------------------------------------------------- //
@@ -417,7 +692,7 @@ function draw(){
   // マウスの値を調整して全画面に合わせる
   const _size = min(width, height);
   const mouse_x = (mouseX / width - 0.5) * 2.0 * width / _size;
-  const mouse_y = -(mouseY / height - 0.5) *2.0 * height / _size;
+  const mouse_y = (mouseY / height - 0.5) *2.0 * height / _size;
   const mouse_flag = mouseIsPressed;
 
   // ここで位置と速度を更新
@@ -435,52 +710,67 @@ function draw(){
     drawBackground();
   }
 
-  // 点描画しない場合はここでおさらばというわけ
-  if(config.HIDE){ return; }
+  // 点描画しない場合は以下の処理をしない
+	// 背景保存モード
+  if(!config.HIDE){
+		// 点描画の色指定
+		let {r, g, b} = getProperColor(config.PARTICLE_COLOR);
 
-  // 点描画の色指定
-  let {r, g, b} = getProperColor(config.PARTICLE_COLOR);
+		if(config.AUTO_COLOR){ // 時間変化
+			const col = _HSV((properFrameCount%720)/720, 0.8, 1);
+			r = col.r; g = col.g; b = col.b;
+		}else{
+			r /= 255; g /= 255; b /= 255;
+		}
 
-  if(config.AUTO_COLOR){ // 時間変化
-    const col = _HSV((properFrameCount%720)/720, 0.8, 1);
-    r = col.r; g = col.g; b = col.b;
-  }else{
-    r /= 255; g /= 255; b /= 255;
-  }
+		// fboをセットし中身をクリアする
+		_node.bindFBO('particle')
+				 .clearFBO();
 
-  // fboをセットし中身をクリアする
-  _node.bindFBO('particle')
-       .clearFBO();
+		// 点描画に際してblendの有効化
+		gl.enable(gl.BLEND);
+		// SCREENだってhttps://yomotsu.net/blog/2013/08/08/2013-08-7-blendmode-in-webgl2.html
+		// よくわかんないけどこれにしとこ
+		gl.blendFunc(gl.ONE_MINUS_DST_COLOR, gl.ONE);
 
-  // blendの有効化
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.ONE, gl.ONE);
+		// 点描画
+		_node.use('point', 'display')
+				 .setAttribute()
+				 .setFBO('uTex', 'data')
+				 .setUniform("uTexSize", TEX_SIZE)
+				 .setUniform("uColor", [r, g, b])
+				 .setUniform("uPointScale", accell)
+				 .setUniform("uResolution", [width, height])
+				 .drawArrays(gl.POINTS)
+				 .clear();
 
-  // 点描画
-  _node.use('point', 'display')
-       .setAttribute()
-       .setFBO('uTex', 'data')
-       .setUniform("uTexSize", TEX_SIZE)
-       .setUniform("uColor", [r, g, b])
-       .setUniform("uPointScale", accell)
-       .setUniform("uResolution", [width, height])
-       .drawArrays(gl.POINTS)
-       .clear();
+		// ここでbloomを計算する(particleを元にして)
+		// mirrorか...
+		// あー、じゃあmirror使った結果を考慮して
+		// それに対してbloomかけないとまずいねぇ
+		// というわけで間にdyeを挟んでそこにmirrorを適用した結果を放り込んで
+		// そのうえでbloomかける流れか。
 
-  // これだ！これを使うと上書きできる！なるほど...
-  // 便利だねぇ...ありがたいね...
-  // bgManagerの救世主。
-  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-  gl.enable(gl.BLEND);
+		// これだ！これを使うと上書きできる！なるほど...
+		// これをやる前にbloomの処理を終わらせる感じ。
+		//gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // drawDisplayまでおあづけ
 
-  _node.bindFBO(null);
-  _node.use('copy', 'board')
-       .setAttribute()
-       .setFBO('uTex', 'particle')
-       .setUniform("uMirror", [config.MIRROR_X, config.MIRROR_Y])
-       .drawArrays(gl.TRIANGLE_STRIP)
-       .clear()
-       .flush();
+		// 一旦blendを切る
+		gl.disable(gl.BLEND);
+
+		// ここでdyeに一旦落とす...
+		_node.bindFBO('dye');
+		_node.use('mirror', 'board')
+				 .setAttribute()
+				 .setFBO('uTex', 'particle')
+				 .setUniform("uMirror", [config.MIRROR_X, config.MIRROR_Y])
+				 .drawArrays(gl.TRIANGLE_STRIP)
+		     .swapFBO('dye')
+				 .clear();
+
+		applyBloom();  // 工事中
+		drawDisplay(); // なのでとりあえずdyeの結果をそのまま表示してみます
+	}
 
   // 画像保存処理
   if(saveFlag){
@@ -506,10 +796,14 @@ function resizeCheck(){
   resizeCanvas(currentWidth, currentHeight);
   // particleとbgを上書き更新（引き継がないので）
   // 引き継ぐならresizeが必要になるけど今回は要らない
+
   // 焼き付け用
   _node.registFBO('particle', 2, currentWidth, currentHeight, gl.FLOAT, gl.NEAREST);
-  // 背景用
-  _node.registFBO('bg', 3, currentWidth, currentHeight);
+
+	// dyeもresizeしないといけない。
+  const halfFloat = ext.textureHalfFloat.HALF_FLOAT_OES;
+  const linearFilterParam = (ext.textureHalfFloatLinear ? gl.LINEAR : gl.NEAREST);
+  _node.registDoubleFBO("dye", 0, width, height, halfFloat, linearFilterParam);
 }
 
 // --------------------------------------------------------------- //
@@ -585,6 +879,108 @@ function drawCheckerBoard(){
        .clear();
 }
 
+// --------------------- //
+// applyBloom.
+
+function applyBloom(){
+  // dyeを元にしてbloomになんか焼き付ける
+  gl.disable(gl.BLEND);
+  let res = getResolution(256);
+
+  let knee = config.BLOOM_THRESHOLD * config.BLOOM_SOFT_KNEE + 0.0001;
+  let curve0 = config.BLOOM_THRESHOLD - knee;
+  let curve1 = knee * 2;
+  let curve2 = 0.25 / knee;
+  // ここの処理texelSize使ってない
+  // dyeの内容を初期値として埋め込んで
+  // 輝度抽出なるものを行なっているようです
+  _node.bindFBO('bloom_0');
+  _node.use('bloomPrefilter', 'simple')
+       .setAttribute()
+       .setFBO('uTexture', 'dye')
+       .setUniform('uCurve', [curve0, curve1, curve2])
+       .setUniform('uThreshold', config.BLOOM_THRESHOLD)
+       .drawArrays(gl.TRIANGLE_STRIP)
+       .clear(); // ここclear必須っぽいな
+
+	// modeは使わないのです
+  // まあ本来はシェーダー切り替えるたびにclear必要だけどね...
+
+  // bloomやっぱ通し番号にするか...0,1,2,...,8みたいに。
+  // その方が良さそう。
+  _node.use('bloomBlur', 'board')
+       .setAttribute();
+  // FBOもuniformもbindやsetするあれごとに異なるので、
+  // その都度設定し直す。
+  // まず0→1, 1→2, ..., N-1→Nとする
+  for(let i = 1; i <= config.BLOOM_ITERATIONS; i++){
+    // i-1→iって感じ
+    const w = (res.frameWidth >> (i-1));
+    const h = (res.frameHeight >> (i-1));
+    _node.bindFBO('bloom_' + i);
+    _node.setUniform('uTexelSize', [1/w, 1/h])
+         .setFBO('uTexture', 'bloom_' + (i-1))
+         .drawArrays(gl.TRIANGLE_STRIP);
+  }
+
+  gl.blendFunc(gl.ONE, gl.ONE);
+  gl.enable(gl.BLEND);
+
+  // 次にN→N-1,...,2→1とする。
+  for(let i = config.BLOOM_ITERATIONS; i >= 2; i--){
+    const w = (res.frameWidth >> i);
+    const h = (res.frameHeight >> i);
+    _node.bindFBO('bloom_' + (i-1));
+    _node.setUniform('uTexelSize', [1/w, 1/h])
+         .setFBO('uTexture', 'bloom_' + i)
+         .drawArrays(gl.TRIANGLE_STRIP);
+  }
+
+  _node.clear();
+  gl.disable(gl.BLEND);
+
+  // 最後に1→0でおしまい
+  const w1 = (res.frameWidth >> 1);
+  const h1 = (res.frameHeight >> 1);
+  const col = getProperColor(config.BLOOM_COLOR);
+  //_node.setViewport(0, 0, res.frameWidth, res.frameHeight);
+  _node.bindFBO('bloom_0');
+  _node.use('bloomFinal', 'board')
+       .setAttribute()
+       .setFBO('uTexture', 'bloom_1')
+       .setUniform('uTexelSize', [1/w1, 1/h1])
+       .setUniform('uIntensity', config.BLOOM_INTENSITY)
+       .setUniform('uBloomColor', [col.r/255, col.g/255, col.b/255])
+       .drawArrays(gl.TRIANGLE_STRIP)
+       .clear();
+  // bloomについては以上。
+}
+
+// --------------------- //
+// drawDisplay.
+
+function drawDisplay(){
+	// スクリーンへの描画。
+  _node.bindFBO(null);
+	// 先に背景があるのでこれをしないといけない
+	gl.enable(gl.BLEND);
+	gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+  _node.use('display', 'board')
+       .setAttribute()
+       .setFBO('uTexture', 'dye')
+       .setUniform('uBloomFlag', config.BLOOM)
+       .setFBO('uBloom', 'bloom_0')
+	     .setUniform('uDitheringFlag', config.BLOOM_DITHER)
+	     .setTexture('uDithering', ditheringTexture.glTex, 14) // やっぱ番号かぶるとまずいんだわ。0はだめだろ...
+	     .setUniform('uDitherScale', [width/ditheringImg.width, height/ditheringImg.height])
+       .drawArrays(gl.TRIANGLE_STRIP)
+       .clear();
+
+	// 戻す。blendが必要ない場合は切る癖をつけた方がいいと思う
+  gl.disable(gl.BLEND);
+}
+
 // --------------------------------------------------------------- //
 // extension check.
 
@@ -620,7 +1016,7 @@ function confirmExtensions(){
 // RenderNodeの処理にする・・？
 
 // fboを作る関数
-function create_fbo(texId, w, h, textureFormat, filterParam){
+function create_fbo(name, texId, w, h, textureFormat, filterParam){
   // フォーマットチェック
   if(!textureFormat){
     textureFormat = gl.UNSIGNED_BYTE;
@@ -630,10 +1026,10 @@ function create_fbo(texId, w, h, textureFormat, filterParam){
   }
 
   // フレームバッファの生成
-  let frameBuffer = gl.createFramebuffer();
+  let framebuffer = gl.createFramebuffer();
 
   // フレームバッファをWebGLにバインド
-  gl.bindFramebuffer(gl.FRAMEBUFFER, frameBuffer);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
 
   // 深度バッファ用レンダーバッファの生成とバインド
   let depthRenderBuffer = gl.createRenderbuffer();
@@ -674,14 +1070,15 @@ function create_fbo(texId, w, h, textureFormat, filterParam){
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   // オブジェクトを返して終了
-  return {f:frameBuffer, d:depthRenderBuffer, t:fTexture, id:texId};
+  return {f:framebuffer, d:depthRenderBuffer, t:fTexture, id:texId, name:name, frameWidth:w, frameHeight:h, texelSizeX:1/w, texelSizeY:1/h};
 }
 
 // fboのペアを作る
-function create_double_fbo(texId, w, h, textureFormat, filterParam){
+// nameはreadやwriteの中に入ってるイメージですかね
+function create_double_fbo(name, texId, w, h, textureFormat, filterParam){
   // texIdは片方について1増やす
-  let fbo1 = create_fbo(texId, w, h, textureFormat, filterParam);
-  let fbo2 = create_fbo(texId + 1, w, h, textureFormat, filterParam);
+  let fbo1 = create_fbo(name, texId, w, h, textureFormat, filterParam);
+  let fbo2 = create_fbo(name, texId + 1, w, h, textureFormat, filterParam);
   let doubleFbo = {};
   doubleFbo.read = fbo1;
   doubleFbo.write = fbo2;
@@ -690,6 +1087,11 @@ function create_double_fbo(texId, w, h, textureFormat, filterParam){
     this.read = this.write;
     this.write = tmp;
   }
+  doubleFbo.frameWidth = w;
+  doubleFbo.frameHeight = h;
+  doubleFbo.texelSizeX = 1/w;
+  doubleFbo.texelSizeY = 1/h;
+  doubleFbo.name = name; // まあ直接アクセスできる方がいいよね
   return doubleFbo;
 }
 
@@ -711,6 +1113,29 @@ function create_vbo(data){
   return vbo;
 }
 
+// IBOを生成する関数
+// たとえばLINESを想定しているなら
+// 0,32,64,...でつなぎたいなら
+// [0,32,32,64,64,96,....,1,33,33,65,65,97,....]とかして作る。
+// typeは「UInt16Array」または「UInt32Array」.
+function create_ibo(data, type){
+  // バッファオブジェクトの生成
+  var ibo = gl.createBuffer();
+
+  // バッファをバインドする
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+
+  // バッファにデータをセット
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new (type)(data), gl.STATIC_DRAW);
+
+  // バッファのバインドを無効化
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+
+  // 生成したIBOを返して終了
+  return ibo;
+}
+
+
 // attributeの登録
 function set_attribute(attributes){
   // 引数として受け取った配列を処理する
@@ -725,6 +1150,26 @@ function set_attribute(attributes){
     // attributeLocationを通知し登録する
     gl.vertexAttribPointer(attr.location, attr.stride, gl.FLOAT, false, 0, 0);
   }
+}
+
+// ----------------------------------------------------------//
+// utility for bloom.
+
+// ちょっとした工夫
+// 2べきに合わせるということらしい
+// 短い方がresolutionで長い方がそれに長/短を掛ける形
+function getResolution(resolution){
+  let aspectRatio = width / height;
+  //let aspectRatio = gl.drawingBufferWidth / gl.drawingBufferHeight;
+  if(aspectRatio < 1){ aspectRatio = 1.0 / aspectRatio; }
+  // 要するに縦横のでかい方÷小さい方
+  let _min = Math.round(resolution);
+  let _max = Math.round(resolution * aspectRatio);
+
+  if(width > height){
+    return {frameWidth: _max, frameHeight: _min};
+  }
+  return {frameWidth: _min, frameHeight: _max};
 }
 
 // --------------------------------------------------------------- //
@@ -874,31 +1319,64 @@ class RenderNode{
     this.useTopology(topologyName);
     return this;
   }
-  registFBO(FBOName, texId, w, h, textureFormat, filterParam){
+  existFBO(target){
+    // あるかどうかチェックする関数. targetがfboの場合はそれが持つnameで見る。
+    if(typeof(target) == 'string'){
+      return this.framebufferObjects[target] !== undefined;
+    }
+    return this.framebufferObjects[target.name] !== undefined;
+  }
+  registFBO(target, texId, w, h, textureFormat, filterParam){
     // fboをセット(同じ名前の場合は新しく作って上書き)
-    //if(this.framebufferObjects[FBOName] !== undefined){ return this; }
-    let fbo = create_fbo(texId, w, h, textureFormat, filterParam);
-    this.framebufferObjects[FBOName] = fbo;
+    // targetがstringの場合はcreate_fboするけど
+    // fbo自身の場合にはそれをはめこんで終了って感じにする
+    if(typeof(target) == 'string'){
+      let fbo = create_fbo(target, texId, w, h, textureFormat, filterParam);
+      this.framebufferObjects[target] = fbo;
+      return this;
+    }
+    // targetがfboの場合。名前はtargetが持ってるはず。直接放り込む。
+    this.framebufferObjects[target.name] = target;
     return this;
   }
-  registDoubleFBO(FBOName, texId, w, h, textureFormat, filterParam){
-    // doubleFBOをセット（同じ名前の場合は新しく作って上書き）
-    //if(this.framebufferObjects[FBOName] !== undefined){ return this; }
-    let fbo = create_double_fbo(texId, w, h, textureFormat, filterParam);
-    this.framebufferObjects[FBOName] = fbo;
+  registDoubleFBO(targetName, texId, w, h, textureFormat, filterParam){
+    //doubleFBOをセット(同じ名前の場合は新しく作って上書き)
+    let fbo = create_double_fbo(targetName, texId, w, h, textureFormat, filterParam);
+    this.framebufferObjects[targetName] = fbo;
     return this;
   }
-  bindFBO(FBOName){
-    // FBOをbindもしくはnullで初期化。ダブルの場合はwriteをセット。
-    if(FBOName == null){
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null); return this;
+  resizeFBO(targetName, texId, w, h, textureFormat, filterParam){
+    // resizeもメソッド化しないと...
+    let fbo = this.framebufferObjects[targetName];
+    this.framebufferObjects[targetName] = resize_fbo(fbo, texId, w, h, textureFormat, filterParam);
+  }
+  resizeDoubleFBO(targetName, texId, w, h, textureFormat, filterParam){
+    // リサイズダブル。これらはreturn thisしなくていいでしょうね
+    let fbo = this.framebufferObjects[targetName];
+    this.framebufferObjects[targetName] = resize_double_fbo(fbo, texId, w, h, textureFormat, filterParam);
+  }
+  bindFBO(target){
+    // FBOをbindもしくはnullで初期化。ダブルの場合はwriteをセット。viewport設定機能を追加。
+    if(typeof(target) == 'string'){
+      let fbo = this.framebufferObjects[target];
+      if(!fbo){ return this; }
+      if(fbo.write){
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.write.f);
+        gl.viewport(0, 0, fbo.frameWidth, fbo.frameHeight);
+        return this;
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.f);
+      gl.viewport(0, 0, fbo.frameWidth, fbo.frameHeight);
+      return this;
     }
-    let fbo = this.framebufferObjects[FBOName];
-    if(!fbo){ return this; }
-    if(fbo.write){
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.write.f); return this;
+    if(target == null){
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, width, height); // nullの場合は全体
+      return this;
     }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.f);
+    // targetがfboそのものの場合。
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.f);
+    gl.viewport(0, 0, target.frameWidth, target.frameHeight);
     return this;
   }
   clearFBO(){
@@ -909,10 +1387,22 @@ class RenderNode{
   }
   setFBO(uniformName, FBOName){
     // FBOを名前経由でセット。ダブルの場合はreadをセット。
-    if(FBOName == null){ return this; }
+    // FBONameがundefinedの状態で運用されることはないうえ、
+    // ここはstringであることが要求される。
+    // fbo.readのところは!!fbo.readってやると
+    // undefinedではありませんって表現できるみたい。その方がいいかも？
+    if(FBOName === undefined || (typeof FBOName !== 'string')){
+      alert("Inappropriate name setting.");
+      noLoop();
+      return this;
+    }
     let fbo = this.framebufferObjects[FBOName];
-    if(!fbo){ return this; }
-    if(fbo.read){
+    if(!fbo){
+      alert("The corresponding framebuffer does not exist.");
+      noLoop();
+      return this;
+    }
+    if(!!fbo.read){
       this.setTexture(uniformName, fbo.read.t, fbo.read.id);
       return this;
     }
@@ -942,9 +1432,10 @@ class RenderNode{
     this.currentTopology.setAttribute();
     return this;
   }
-  registIndexBuffer(data, type){
-    // デフォルトはUint16Array. 多い場合はUint32Arrayを指定する。
-    if(type === undefined){ type = Uint16Array; }
+  registIndexBuffer(data){
+    // 65535より大きい場合にUint32Arrayを指定する。
+    let type = Uint16Array;
+    if(data.length > 65535){ type = Uint32Array; }
     this.currentTopology.registIndexBuffer(data, type);
     return this;
   }
@@ -1044,6 +1535,11 @@ class RenderNode{
     sh.setUniform('uMonoColor', [col.r, col.g, col.b, a]);
     return this;
   }
+  setUVColor(){
+    const sh = this.currentShader;
+    sh.setUniform("uUseColorFlag", 2);
+    return this;
+  }
   setDirectionalLight(col, x, y, z){
     const sh = this.currentShader;
     sh.setUniform('uUseDirectionalLight', true);
@@ -1097,7 +1593,6 @@ class RenderNode{
 // 同じ内容でもプログラムが違えば違うトポロジーになるので
 // 使い回しはできないですね・・・（ロケーション）
 
-// attributes:{"programName":{}}
 class Topology{
   constructor(name){
     this.name = name;
@@ -1128,7 +1623,6 @@ class Topology{
     this.attributes[attributeName] = attr;
   }
   setAttribute(){
-    // ここでシェーダー名を引数に取ってそれを・・ってやればいいのね。
     set_attribute(this.attributes);
   }
   registIndexBuffer(data, type){
@@ -1146,7 +1640,6 @@ class Topology{
     return this;
   }
 }
-
 // -------------------------------------------- //
 // keyAction.
 
